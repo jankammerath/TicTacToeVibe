@@ -116,17 +116,43 @@ void computer_move(struct GameState *state) {
     }
 }
 
-// Callback for when a request is completed
+// Post data processor callback
+static enum MHD_Result post_iterator(void *cls, 
+                                  enum MHD_ValueKind kind, 
+                                  const char *key,
+                                  const char *filename, 
+                                  const char *content_type,
+                                  const char *transfer_encoding, 
+                                  const char *data,
+                                  uint64_t off, 
+                                  size_t size)
+{
+    printf("Received POST field: %s=%.*s\n", key, (int)size, data);
+    // We don't actually use this for JSON parsing
+    // Our manual parsing happens directly in the request handler
+    return MHD_YES;
+}
+
+// Update the request_completed function to clean up the connection info
 static void request_completed(void *cls, struct MHD_Connection *connection,
     void **con_cls, enum MHD_RequestTerminationCode toe)
 {
     printf("Request completed with code: %d\n", toe);
     if (*con_cls != NULL) {
-        // No need to free game_state here; it's static
+        struct ConnectionInfo *con_info = *con_cls;
+        free(con_info);  // Free the connection info
         *con_cls = NULL;
     }
 }
 
+// Then create a struct to track POST state separately
+struct ConnectionInfo {
+    struct GameState *game_state;
+    int position_received;
+    int position;
+};
+
+// Update the request handler
 static enum MHD_Result request_handler(void *cls,
                                       struct MHD_Connection *connection,
                                       const char *url,
@@ -138,12 +164,30 @@ static enum MHD_Result request_handler(void *cls,
 {
     static struct GameState game_state;
     
+    // First call, initialize connection info
     if (*con_cls == NULL) {
-        init_game(&game_state);
-        *con_cls = &game_state;
-        printf("Initialized new game state\n");
+        struct ConnectionInfo *con_info = malloc(sizeof(struct ConnectionInfo));
+        if (!con_info) return MHD_NO;
+        
+        con_info->game_state = &game_state;
+        con_info->position_received = 0;
+        con_info->position = -1;
+        
+        *con_cls = con_info;
+        
+        // Only initialize game state for GET / requests
+        if (strcmp(method, "GET") == 0 && strcmp(url, "/") == 0) {
+            init_game(&game_state);
+            printf("Initialized new game state\n");
+        }
+        
+        // For POST requests, we need to return and wait for the next call with data
+        if (strcmp(method, "POST") == 0) {
+            return MHD_YES;
+        }
     }
 
+    struct ConnectionInfo *con_info = *con_cls;
     struct MHD_Response *response;
     enum MHD_Result ret;
 
@@ -165,25 +209,11 @@ static enum MHD_Result request_handler(void *cls,
     
     // Handle player move
     if (strcmp(method, "POST") == 0 && strcmp(url, "/move") == 0) {
-        // First call: wait for data
-        if (*con_cls == NULL) {
-            struct MHD_PostProcessor *pp = MHD_create_post_processor(
-                connection, 1024, &post_iterator, NULL);
-            
-            if (pp == NULL) {
-                return MHD_NO;
-            }
-            
-            *con_cls = pp;
-            return MHD_YES;
-        }
-        
+        // First pass with data
         if (*upload_data_size != 0) {
-            // We're still receiving data
             printf("Received POST data: %.*s\n", (int)*upload_data_size, upload_data);
             
-            // Process the data separately
-            int position = -1;
+            // Process the data
             const char *json = (const char *)upload_data;
             const char *pos_marker = strstr(json, "position");
             
@@ -193,20 +223,19 @@ static enum MHD_Result request_handler(void *cls,
                     // Skip whitespace after colon
                     while (*++pos_marker == ' ');
                     // Parse the position number
-                    position = atoi(pos_marker);
-                    printf("Parsed position: %d\n", position);
+                    con_info->position = atoi(pos_marker);
+                    con_info->position_received = 1;
                     
-                    // Store the position for later use
-                    game_state.last_position = position;
+                    printf("Parsed position: %d\n", con_info->position);
                 }
             }
             
             *upload_data_size = 0;
-            return MHD_YES;
+            return MHD_YES;  // We have processed the data, but need another call to finalize
         }
         
         // Data fully received, process the move
-        int position = game_state.last_position;
+        int position = con_info->position;
         
         if (position < 0 || position > 8) {
             printf("Invalid position format: %d\n", position);
