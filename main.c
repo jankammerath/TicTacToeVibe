@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 // HTML content with embedded JavaScript for Tic-Tac-Toe
 static const char *html_page = 
@@ -146,13 +148,79 @@ static void request_completed(void *cls, struct MHD_Connection *connection,
 }
 
 // Then create a struct to track POST state separately
+#define MAX_SESSIONS 100
+
+// Game session structure
+struct GameSession {
+    struct GameState game_state;
+    char session_id[37];  // 36 chars for UUID + null terminator
+    time_t last_access;
+    bool in_use;
+};
+
+// Sessions manager
+static struct {
+    struct GameSession sessions[MAX_SESSIONS];
+    int count;
+} sessions_manager;
+
+// Initialize sessions manager
+void init_sessions_manager() {
+    memset(&sessions_manager, 0, sizeof(sessions_manager));
+}
+
+// Generate a simple session ID (not cryptographically secure, but sufficient for demo)
+void generate_session_id(char *buffer) {
+    static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (int i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            buffer[i] = '-';
+        } else {
+            buffer[i] = chars[rand() % (sizeof(chars) - 1)];
+        }
+    }
+    buffer[36] = '\0';
+}
+
+// Create a new session
+struct GameSession* create_session() {
+    // Find an empty slot
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!sessions_manager.sessions[i].in_use) {
+            struct GameSession* session = &sessions_manager.sessions[i];
+            init_game(&session->game_state);
+            generate_session_id(session->session_id);
+            session->last_access = time(NULL);
+            session->in_use = true;
+            sessions_manager.count++;
+            printf("Created new session: %s\n", session->session_id);
+            return session;
+        }
+    }
+    printf("Failed to create session - max sessions reached\n");
+    return NULL;
+}
+
+// Find session by ID
+struct GameSession* find_session(const char* session_id) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions_manager.sessions[i].in_use && 
+            strcmp(sessions_manager.sessions[i].session_id, session_id) == 0) {
+            sessions_manager.sessions[i].last_access = time(NULL);
+            return &sessions_manager.sessions[i];
+        }
+    }
+    return NULL;
+}
+
+// Update connection info to store session data
 struct ConnectionInfo {
-    struct GameState *game_state;
+    struct GameSession *session;
     int position_received;
     int position;
 };
 
-// Update the request handler
+// Update the request handler to use sessions
 static enum MHD_Result request_handler(void *cls,
                                       struct MHD_Connection *connection,
                                       const char *url,
@@ -162,24 +230,15 @@ static enum MHD_Result request_handler(void *cls,
                                       size_t *upload_data_size,
                                       void **con_cls)
 {
-    static struct GameState game_state;
-    
     // First call, initialize connection info
     if (*con_cls == NULL) {
         struct ConnectionInfo *con_info = malloc(sizeof(struct ConnectionInfo));
         if (!con_info) return MHD_NO;
         
-        con_info->game_state = &game_state;
         con_info->position_received = 0;
         con_info->position = -1;
         
         *con_cls = con_info;
-        
-        // Only initialize game state for GET / requests
-        if (strcmp(method, "GET") == 0 && strcmp(url, "/") == 0) {
-            init_game(&game_state);
-            printf("Initialized new game state\n");
-        }
         
         // For POST requests, we need to return and wait for the next call with data
         if (strcmp(method, "POST") == 0) {
@@ -190,11 +249,51 @@ static enum MHD_Result request_handler(void *cls,
     struct ConnectionInfo *con_info = *con_cls;
     struct MHD_Response *response;
     enum MHD_Result ret;
+    
+    // Get session ID from cookies
+    const char *cookie_header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Cookie");
+    char session_id[37] = {0};
+    struct GameSession *session = NULL;
+    
+    // Extract session ID from cookie if it exists
+    if (cookie_header) {
+        const char *session_cookie = strstr(cookie_header, "session=");
+        if (session_cookie) {
+            session_cookie += 8; // Skip "session="
+            int i = 0;
+            while (i < 36 && session_cookie[i] && session_cookie[i] != ';') {
+                session_id[i] = session_cookie[i];
+                i++;
+            }
+            session_id[i] = '\0';
+            
+            // Find the session
+            session = find_session(session_id);
+        }
+    }
 
-    printf("Request: %s %s\n", method, url);
+    printf("Request: %s %s (Session: %s)\n", method, url, session ? session_id : "None");
 
-    // Serve the main page
+    // Serve the main page and create a new session if needed
     if (strcmp(method, "GET") == 0 && strcmp(url, "/") == 0) {
+        if (!session) {
+            // Create a new session for this user
+            session = create_session();
+            if (!session) {
+                response = MHD_create_response_from_buffer(
+                    strlen("Server busy, try again later"),
+                    (void*)"Server busy, try again later",
+                    MHD_RESPMEM_PERSISTENT
+                );
+                ret = MHD_queue_response(connection, MHD_HTTP_SERVICE_UNAVAILABLE, response);
+                return ret;
+            }
+        }
+        
+        // Set session for this connection
+        con_info->session = session;
+        
+        // Create response
         response = MHD_create_response_from_buffer(strlen(html_page),
                                                  (void *)html_page,
                                                  MHD_RESPMEM_PERSISTENT);
@@ -202,31 +301,48 @@ static enum MHD_Result request_handler(void *cls,
             printf("Failed to create GET response\n");
             return MHD_NO;
         }
+        
+        // Set session cookie
+        char cookie[100];
+        snprintf(cookie, sizeof(cookie), "session=%s; Path=/; SameSite=Strict", session->session_id);
+        MHD_add_response_header(response, "Set-Cookie", cookie);
         MHD_add_response_header(response, "Content-Type", "text/html");
         ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
         return ret;
     }
     
+    // For other requests, require a valid session
+    if (!session) {
+        response = MHD_create_response_from_buffer(
+            strlen("Invalid session"),
+            (void*)"Invalid session",
+            MHD_RESPMEM_PERSISTENT
+        );
+        ret = MHD_queue_response(connection, MHD_HTTP_UNAUTHORIZED, response);
+        return ret;
+    }
+    
+    // Store session in connection info
+    con_info->session = session;
+    
     // Handle player move
     if (strcmp(method, "POST") == 0 && strcmp(url, "/move") == 0) {
         // First pass with data
         if (*upload_data_size != 0) {
-            printf("Received POST data: %.*s\n", (int)*upload_data_size, upload_data);
-            
-            // Process the data
+            // Process data - parse position
             const char *json = (const char *)upload_data;
             const char *pos_marker = strstr(json, "position");
             
             if (pos_marker) {
                 pos_marker = strchr(pos_marker, ':');
                 if (pos_marker) {
-                    // Skip whitespace after colon
-                    while (*++pos_marker == ' ');
                     // Parse the position number
+                    while (*++pos_marker == ' ');
                     con_info->position = atoi(pos_marker);
                     con_info->position_received = 1;
                     
-                    printf("Parsed position: %d\n", con_info->position);
+                    printf("Parsed position: %d for session %s\n", 
+                           con_info->position, session->session_id);
                 }
             }
             
@@ -236,6 +352,7 @@ static enum MHD_Result request_handler(void *cls,
         
         // Data fully received, process the move
         int position = con_info->position;
+        struct GameState *game_state = &session->game_state;
         
         if (position < 0 || position > 8) {
             printf("Invalid position format: %d\n", position);
@@ -249,30 +366,30 @@ static enum MHD_Result request_handler(void *cls,
         }
         
         // Continue with move processing
-        if (game_state.board[position] != 0 || game_state.game_over) {
-            printf("Invalid move: position=%d\n", position);
-            const char *error_msg = game_state.board[position] != 0 ? 
-                                 "Position already taken" : "Game is over";
+        if (game_state->board[position] != 0 || game_state->game_over) {
+            const char *error_msg = game_state->board[position] != 0 ? 
+                                  "Position already taken" : "Game is over";
             response = MHD_create_response_from_buffer(strlen(error_msg), 
-                                                      (void *)error_msg,
-                                                      MHD_RESPMEM_PERSISTENT);
+                                                     (void *)error_msg,
+                                                     MHD_RESPMEM_PERSISTENT);
             MHD_add_response_header(response, "Content-Type", "text/plain");
             ret = MHD_queue_response(connection, 
-                                  game_state.board[position] != 0 ? MHD_HTTP_CONFLICT : MHD_HTTP_FORBIDDEN,
-                                  response);
+                                   game_state->board[position] != 0 ? 
+                                   MHD_HTTP_CONFLICT : MHD_HTTP_FORBIDDEN,
+                                   response);
             return ret;
         }
         
         // Valid move, process it
-        game_state.board[position] = 1; // X for player
-        int winner = check_winner(game_state.board);
+        game_state->board[position] = 1; // X for player
+        int winner = check_winner(game_state->board);
         
         if (winner == 0) {
-            computer_move(&game_state);
-            winner = check_winner(game_state.board);
+            computer_move(game_state);
+            winner = check_winner(game_state->board);
         }
         
-        game_state.game_over = (winner != 0);
+        game_state->game_over = (winner != 0);
         
         // Create the response
         char response_str[256];
@@ -280,13 +397,13 @@ static enum MHD_Result request_handler(void *cls,
                           "{\"board\":[%d,%d,%d,%d,%d,%d,%d,%d,%d],"
                           "\"message\":\"%s\","
                           "\"gameOver\":%s}",
-                          game_state.board[0], game_state.board[1], game_state.board[2],
-                          game_state.board[3], game_state.board[4], game_state.board[5],
-                          game_state.board[6], game_state.board[7], game_state.board[8],
+                          game_state->board[0], game_state->board[1], game_state->board[2],
+                          game_state->board[3], game_state->board[4], game_state->board[5],
+                          game_state->board[6], game_state->board[7], game_state->board[8],
                           winner == 1 ? "You win!" : 
                           winner == 2 ? "Computer wins!" : 
                           winner == 3 ? "Draw!" : "Computer\'s turn",
-                          game_state.game_over ? "true" : "false");
+                          game_state->game_over ? "true" : "false");
         
         // Use MUST_COPY for stack-allocated response string
         response = MHD_create_response_from_buffer(strlen(response_str),
@@ -295,25 +412,24 @@ static enum MHD_Result request_handler(void *cls,
         MHD_add_response_header(response, "Content-Type", "application/json");
         ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
         
-        printf("Move processed successfully\n");
+        printf("Move processed successfully for session %s\n", session->session_id);
         return ret;
     }
     
     // Handle reset
     if (strcmp(method, "POST") == 0 && strcmp(url, "/reset") == 0) {
-        init_game(&game_state);
+        init_game(&session->game_state);
         char response_str[128];
         snprintf(response_str, sizeof(response_str),
                 "{\"board\":[%d,%d,%d,%d,%d,%d,%d,%d,%d]}",
-                game_state.board[0], game_state.board[1], game_state.board[2],
-                game_state.board[3], game_state.board[4], game_state.board[5],
-                game_state.board[6], game_state.board[7], game_state.board[8]);
+                0, 0, 0, 0, 0, 0, 0, 0, 0);
         
         response = MHD_create_response_from_buffer(strlen(response_str),
                                                  (void *)response_str,
                                                  MHD_RESPMEM_MUST_COPY);
         MHD_add_response_header(response, "Content-Type", "application/json");
         ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+        printf("Game reset for session %s\n", session->session_id);
         return ret;
     }
 
@@ -322,11 +438,28 @@ static enum MHD_Result request_handler(void *cls,
     return ret;
 }
 
+// Add a cleanup function for idle sessions
+void cleanup_sessions() {
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions_manager.sessions[i].in_use && 
+            difftime(now, sessions_manager.sessions[i].last_access) > 1800) {  // 30 minutes
+            printf("Cleaning up idle session: %s\n", sessions_manager.sessions[i].session_id);
+            sessions_manager.sessions[i].in_use = false;
+            sessions_manager.count--;
+        }
+    }
+}
+
+// Update the main function
 int main(void)
 {
     srand(time(NULL));
     struct MHD_Daemon *daemon;
     const int port = 8888;
+    
+    // Initialize sessions manager
+    init_sessions_manager();
 
     daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG,
                              port,
@@ -343,7 +476,35 @@ int main(void)
 
     printf("Server running on port %d\n", port);
     printf("Press Enter to stop the server...\n");
-    getchar();
+    
+    // Run a periodic cleanup every 5 minutes
+    time_t last_cleanup = time(NULL);
+    
+    while (1) {
+        // Check for keyboard input with timeout
+        fd_set fds;
+        struct timeval tv;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        tv.tv_sec = 60;  // Check every minute
+        tv.tv_usec = 0;
+        
+        int result = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+        
+        if (result > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
+            getchar();  // Consume the Enter key
+            break;
+        }
+        
+        // Periodically clean up idle sessions
+        time_t now = time(NULL);
+        if (difftime(now, last_cleanup) > 300) {  // 5 minutes
+            printf("Running session cleanup...\n");
+            cleanup_sessions();
+            last_cleanup = now;
+        }
+    }
+    
     MHD_stop_daemon(daemon);
     return 0;
 }
