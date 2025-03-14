@@ -1,0 +1,23 @@
+[Unit]
+Description=TicTacToe Game Server
+After=network.target
+
+[Service]
+Type=simple
+User=tictactoe
+Group=tictactoe
+WorkingDirectory=/opt/tictactoe
+ExecStart=/opt/tictactoe/tictactoe
+Restart=on-failure
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=tictactoe
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
